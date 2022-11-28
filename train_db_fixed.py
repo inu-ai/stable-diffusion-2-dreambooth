@@ -1532,7 +1532,7 @@ def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_p
       key = prefix + k
       assert key in state_dict, f"Illegal key in save SD: {key}"
       if save_dtype is not None:
-        v = v.detach().clone().to("cuda").to(save_dtype)
+        v = v.detach().clone().to("cpu").to(save_dtype)
       state_dict[key] = v
 
   # Convert the UNet model
