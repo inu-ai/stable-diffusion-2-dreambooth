@@ -812,7 +812,7 @@ def load_checkpoint_with_text_encoder_conversion(ckpt_path):
       ('cond_stage_model.transformer.final_layer_norm.', 'cond_stage_model.transformer.text_model.final_layer_norm.')
   ]
 
-  checkpoint = torch.load(ckpt_path, map_location="cpu")
+  checkpoint = torch.load(ckpt_path, map_location="cuda")
   state_dict = checkpoint["state_dict"]
 
   key_reps = []
@@ -2555,11 +2555,11 @@ def load_vae(vae, dtype):
 
   if vae.endswith(".bin"):
     # SD 1.5 VAE on Huggingface
-    vae_sd = torch.load(vae, map_location="cpu")
+    vae_sd = torch.load(vae, map_location="cuda")
     converted_vae_checkpoint = vae_sd
   else:
     # StableDiffusion
-    vae_model = torch.load(vae, map_location="cpu")
+    vae_model = torch.load(vae, map_location="cuda")
     vae_sd = vae_model['state_dict']
 
     # vae only or full model
