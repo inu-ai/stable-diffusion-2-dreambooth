@@ -9,5 +9,5 @@
 https://www.youtube.com/@inu-AI
 
 ## Credits
-- train_db_fixed_v12.py - https://note.com/kohya_ss/n/nee3ed1649fb6
+- train_db_fixed_v13.py - https://note.com/kohya_ss/n/nee3ed1649fb6
 - gen_img_diffusers_v4.py - https://note.com/kohya_ss/n/n2693183a798e
