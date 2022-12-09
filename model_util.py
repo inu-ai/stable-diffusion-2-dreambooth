@@ -829,9 +829,9 @@ def load_checkpoint_with_text_encoder_conversion(ckpt_path):
 
   if is_safetensors(ckpt_path):
     checkpoint = None
-    state_dict = load_file(ckpt_path, "cpu")
+    state_dict = load_file(ckpt_path, "cuda")
   else:
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    checkpoint = torch.load(ckpt_path, map_location="cuda")
     if "state_dict" in checkpoint:
       state_dict = checkpoint["state_dict"]
     else:
@@ -1079,11 +1079,11 @@ def load_vae(vae_id, dtype):
 
   if vae_id.endswith(".bin"):
     # SD 1.5 VAE on Huggingface
-    vae_sd = torch.load(vae_id, map_location="cpu")
+    vae_sd = torch.load(vae_id, map_location="cuda")
     converted_vae_checkpoint = vae_sd
   else:
     # StableDiffusion
-    vae_model = torch.load(vae_id, map_location="cpu")
+    vae_model = torch.load(vae_id, map_location="cuda")
     vae_sd = vae_model['state_dict']
 
     # vae only or full model
