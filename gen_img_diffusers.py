@@ -3,7 +3,8 @@
 # v2: CLIP guided Stable Diffusion, Image guided Stable Diffusion, highres. fix
 # v3: Add dpmsolver/dpmsolver++, add VAE loading, add upscale, add 'bf16', fix the issue hypernetwork_mul is not working
 # v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
-
+# v5: fix clip_sample=True for scheduler, add VGG guidance
+# v6: refactor to use model util, load VAE without vae folder, support safe tensors
 
 # Copyright 2022 kohya_ss @kohya_ss
 #
@@ -27,6 +28,53 @@
 # Diffusers (model conversion, CLIP guided stable diffusion, schedulers etc.):
 # ASL 2.0 https://github.com/huggingface/diffusers/blob/main/LICENSE
 
+"""
+VGG(
+  (features): Sequential(
+    (0): Conv2d(3, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (1): ReLU(inplace=True)
+    (2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (3): ReLU(inplace=True)
+    (4): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (5): Conv2d(64, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (6): ReLU(inplace=True)
+    (7): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (8): ReLU(inplace=True)
+    (9): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (10): Conv2d(128, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (11): ReLU(inplace=True)
+    (12): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (13): ReLU(inplace=True)
+    (14): Conv2d(256, 256, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (15): ReLU(inplace=True)
+    (16): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (17): Conv2d(256, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (18): ReLU(inplace=True)
+    (19): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (20): ReLU(inplace=True)
+    (21): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (22): ReLU(inplace=True)
+    (23): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+    (24): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (25): ReLU(inplace=True)
+    (26): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (27): ReLU(inplace=True)
+    (28): Conv2d(512, 512, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1))
+    (29): ReLU(inplace=True)
+    (30): MaxPool2d(kernel_size=2, stride=2, padding=0, dilation=1, ceil_mode=False)
+  )
+  (avgpool): AdaptiveAvgPool2d(output_size=(7, 7))
+  (classifier): Sequential(
+    (0): Linear(in_features=25088, out_features=4096, bias=True)
+    (1): ReLU(inplace=True)
+    (2): Dropout(p=0.5, inplace=False)
+    (3): Linear(in_features=4096, out_features=4096, bias=True)
+    (4): ReLU(inplace=True)
+    (5): Dropout(p=0.5, inplace=False)
+    (6): Linear(in_features=4096, out_features=1000, bias=True)
+  )
+)
+"""
 
 from typing import List, Optional, Union
 import glob
@@ -45,6 +93,7 @@ from typing import Any, Callable, List, Optional, Union
 import diffusers
 import numpy as np
 import torch
+import torchvision
 from diffusers import (AutoencoderKL, DDPMScheduler,
                        EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler,
                        LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, EulerDiscreteScheduler,
@@ -58,6 +107,8 @@ import PIL
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+import model_util
+
 # Tokenizer: checkpointから読み込むのではなくあらかじめ提供されているものを使う
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
 V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"     # ここからtokenizerだけ使う
@@ -70,8 +121,11 @@ SCHEDULER_LINEAR_END = 0.0120
 SCHEDULER_TIMESTEPS = 1000
 SCHEDLER_SCHEDULE = 'scaled_linear'
 
+# その他の設定
 LATENT_CHANNELS = 4
 DOWNSAMPLING_FACTOR = 8
+
+# CLIP_ID_L14_336 = "openai/clip-vit-large-patch14-336"
 
 # CLIP guided SD関連
 CLIP_MODEL_PATH = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
@@ -79,928 +133,12 @@ FEATURE_EXTRACTOR_SIZE = (224, 224)
 FEATURE_EXTRACTOR_IMAGE_MEAN = [0.48145466, 0.4578275, 0.40821073]
 FEATURE_EXTRACTOR_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
 
+VGG16_IMAGE_MEAN = [0.485, 0.456, 0.406]
+VGG16_IMAGE_STD = [0.229, 0.224, 0.225]
+
 # CLIP特徴量の取得時にcutoutを使うか：使う場合にはソースを書き換えてください
 NUM_CUTOUTS = 4
 USE_CUTOUTS = False
-
-# region モデル変換
-
-# StableDiffusionのモデルパラメータ
-NUM_TRAIN_TIMESTEPS = 1000
-BETA_START = 0.00085
-BETA_END = 0.0120
-
-UNET_PARAMS_MODEL_CHANNELS = 320
-UNET_PARAMS_CHANNEL_MULT = [1, 2, 4, 4]
-UNET_PARAMS_ATTENTION_RESOLUTIONS = [4, 2, 1]
-UNET_PARAMS_IMAGE_SIZE = 32  # unused
-UNET_PARAMS_IN_CHANNELS = 4
-UNET_PARAMS_OUT_CHANNELS = 4
-UNET_PARAMS_NUM_RES_BLOCKS = 2
-UNET_PARAMS_CONTEXT_DIM = 768
-UNET_PARAMS_NUM_HEADS = 8
-
-VAE_PARAMS_Z_CHANNELS = 4
-VAE_PARAMS_RESOLUTION = 256
-VAE_PARAMS_IN_CHANNELS = 3
-VAE_PARAMS_OUT_CH = 3
-VAE_PARAMS_CH = 128
-VAE_PARAMS_CH_MULT = [1, 2, 4, 4]
-VAE_PARAMS_NUM_RES_BLOCKS = 2
-
-# V2
-V2_UNET_PARAMS_ATTENTION_HEAD_DIM = [5, 10, 20, 20]
-V2_UNET_PARAMS_CONTEXT_DIM = 1024
-
-# region checkpoint変換、読み込み、書き込み ###############################
-
-# region StableDiffusion->Diffusersの変換コード
-# convert_original_stable_diffusion_to_diffusers をコピーしている（ASL 2.0）
-
-
-def shave_segments(path, n_shave_prefix_segments=1):
-  """
-  Removes segments. Positive values shave the first segments, negative shave the last segments.
-  """
-  if n_shave_prefix_segments >= 0:
-    return ".".join(path.split(".")[n_shave_prefix_segments:])
-  else:
-    return ".".join(path.split(".")[:n_shave_prefix_segments])
-
-
-def renew_resnet_paths(old_list, n_shave_prefix_segments=0):
-  """
-  Updates paths inside resnets to the new naming scheme (local renaming)
-  """
-  mapping = []
-  for old_item in old_list:
-    new_item = old_item.replace("in_layers.0", "norm1")
-    new_item = new_item.replace("in_layers.2", "conv1")
-
-    new_item = new_item.replace("out_layers.0", "norm2")
-    new_item = new_item.replace("out_layers.3", "conv2")
-
-    new_item = new_item.replace("emb_layers.1", "time_emb_proj")
-    new_item = new_item.replace("skip_connection", "conv_shortcut")
-
-    new_item = shave_segments(new_item, n_shave_prefix_segments=n_shave_prefix_segments)
-
-    mapping.append({"old": old_item, "new": new_item})
-
-  return mapping
-
-
-def renew_vae_resnet_paths(old_list, n_shave_prefix_segments=0):
-  """
-  Updates paths inside resnets to the new naming scheme (local renaming)
-  """
-  mapping = []
-  for old_item in old_list:
-    new_item = old_item
-
-    new_item = new_item.replace("nin_shortcut", "conv_shortcut")
-    new_item = shave_segments(new_item, n_shave_prefix_segments=n_shave_prefix_segments)
-
-    mapping.append({"old": old_item, "new": new_item})
-
-  return mapping
-
-
-def renew_attention_paths(old_list, n_shave_prefix_segments=0):
-  """
-  Updates paths inside attentions to the new naming scheme (local renaming)
-  """
-  mapping = []
-  for old_item in old_list:
-    new_item = old_item
-
-    #         new_item = new_item.replace('norm.weight', 'group_norm.weight')
-    #         new_item = new_item.replace('norm.bias', 'group_norm.bias')
-
-    #         new_item = new_item.replace('proj_out.weight', 'proj_attn.weight')
-    #         new_item = new_item.replace('proj_out.bias', 'proj_attn.bias')
-
-    #         new_item = shave_segments(new_item, n_shave_prefix_segments=n_shave_prefix_segments)
-
-    mapping.append({"old": old_item, "new": new_item})
-
-  return mapping
-
-
-def renew_vae_attention_paths(old_list, n_shave_prefix_segments=0):
-  """
-  Updates paths inside attentions to the new naming scheme (local renaming)
-  """
-  mapping = []
-  for old_item in old_list:
-    new_item = old_item
-
-    new_item = new_item.replace("norm.weight", "group_norm.weight")
-    new_item = new_item.replace("norm.bias", "group_norm.bias")
-
-    new_item = new_item.replace("q.weight", "query.weight")
-    new_item = new_item.replace("q.bias", "query.bias")
-
-    new_item = new_item.replace("k.weight", "key.weight")
-    new_item = new_item.replace("k.bias", "key.bias")
-
-    new_item = new_item.replace("v.weight", "value.weight")
-    new_item = new_item.replace("v.bias", "value.bias")
-
-    new_item = new_item.replace("proj_out.weight", "proj_attn.weight")
-    new_item = new_item.replace("proj_out.bias", "proj_attn.bias")
-
-    new_item = shave_segments(new_item, n_shave_prefix_segments=n_shave_prefix_segments)
-
-    mapping.append({"old": old_item, "new": new_item})
-
-  return mapping
-
-
-def assign_to_checkpoint(
-    paths, checkpoint, old_checkpoint, attention_paths_to_split=None, additional_replacements=None, config=None
-):
-  """
-  This does the final conversion step: take locally converted weights and apply a global renaming
-  to them. It splits attention layers, and takes into account additional replacements
-  that may arise.
-
-  Assigns the weights to the new checkpoint.
-  """
-  assert isinstance(paths, list), "Paths should be a list of dicts containing 'old' and 'new' keys."
-
-  # Splits the attention layers into three variables.
-  if attention_paths_to_split is not None:
-    for path, path_map in attention_paths_to_split.items():
-      old_tensor = old_checkpoint[path]
-      channels = old_tensor.shape[0] // 3
-
-      target_shape = (-1, channels) if len(old_tensor.shape) == 3 else (-1)
-
-      num_heads = old_tensor.shape[0] // config["num_head_channels"] // 3
-
-      old_tensor = old_tensor.reshape((num_heads, 3 * channels // num_heads) + old_tensor.shape[1:])
-      query, key, value = old_tensor.split(channels // num_heads, dim=1)
-
-      checkpoint[path_map["query"]] = query.reshape(target_shape)
-      checkpoint[path_map["key"]] = key.reshape(target_shape)
-      checkpoint[path_map["value"]] = value.reshape(target_shape)
-
-  for path in paths:
-    new_path = path["new"]
-
-    # These have already been assigned
-    if attention_paths_to_split is not None and new_path in attention_paths_to_split:
-      continue
-
-    # Global renaming happens here
-    new_path = new_path.replace("middle_block.0", "mid_block.resnets.0")
-    new_path = new_path.replace("middle_block.1", "mid_block.attentions.0")
-    new_path = new_path.replace("middle_block.2", "mid_block.resnets.1")
-
-    if additional_replacements is not None:
-      for replacement in additional_replacements:
-        new_path = new_path.replace(replacement["old"], replacement["new"])
-
-    # proj_attn.weight has to be converted from conv 1D to linear
-    if "proj_attn.weight" in new_path:
-      checkpoint[new_path] = old_checkpoint[path["old"]][:, :, 0]
-    else:
-      checkpoint[new_path] = old_checkpoint[path["old"]]
-
-
-def conv_attn_to_linear(checkpoint):
-  keys = list(checkpoint.keys())
-  attn_keys = ["query.weight", "key.weight", "value.weight"]
-  for key in keys:
-    if ".".join(key.split(".")[-2:]) in attn_keys:
-      if checkpoint[key].ndim > 2:
-        checkpoint[key] = checkpoint[key][:, :, 0, 0]
-    elif "proj_attn.weight" in key:
-      if checkpoint[key].ndim > 2:
-        checkpoint[key] = checkpoint[key][:, :, 0]
-
-
-def linear_transformer_to_conv(checkpoint):
-  keys = list(checkpoint.keys())
-  tf_keys = ["proj_in.weight", "proj_out.weight"]
-  for key in keys:
-    if ".".join(key.split(".")[-2:]) in tf_keys:
-      if checkpoint[key].ndim == 2:
-        checkpoint[key] = checkpoint[key].unsqueeze(2).unsqueeze(2)
-
-
-def convert_ldm_unet_checkpoint(v2, checkpoint, config):
-  """
-  Takes a state dict and a config, and returns a converted checkpoint.
-  """
-
-  # extract state_dict for UNet
-  unet_state_dict = {}
-  unet_key = "model.diffusion_model."
-  keys = list(checkpoint.keys())
-  for key in keys:
-    if key.startswith(unet_key):
-      unet_state_dict[key.replace(unet_key, "")] = checkpoint.pop(key)
-
-  new_checkpoint = {}
-
-  new_checkpoint["time_embedding.linear_1.weight"] = unet_state_dict["time_embed.0.weight"]
-  new_checkpoint["time_embedding.linear_1.bias"] = unet_state_dict["time_embed.0.bias"]
-  new_checkpoint["time_embedding.linear_2.weight"] = unet_state_dict["time_embed.2.weight"]
-  new_checkpoint["time_embedding.linear_2.bias"] = unet_state_dict["time_embed.2.bias"]
-
-  new_checkpoint["conv_in.weight"] = unet_state_dict["input_blocks.0.0.weight"]
-  new_checkpoint["conv_in.bias"] = unet_state_dict["input_blocks.0.0.bias"]
-
-  new_checkpoint["conv_norm_out.weight"] = unet_state_dict["out.0.weight"]
-  new_checkpoint["conv_norm_out.bias"] = unet_state_dict["out.0.bias"]
-  new_checkpoint["conv_out.weight"] = unet_state_dict["out.2.weight"]
-  new_checkpoint["conv_out.bias"] = unet_state_dict["out.2.bias"]
-
-  # Retrieves the keys for the input blocks only
-  num_input_blocks = len({".".join(layer.split(".")[:2]) for layer in unet_state_dict if "input_blocks" in layer})
-  input_blocks = {
-      layer_id: [key for key in unet_state_dict if f"input_blocks.{layer_id}" in key]
-      for layer_id in range(num_input_blocks)
-  }
-
-  # Retrieves the keys for the middle blocks only
-  num_middle_blocks = len({".".join(layer.split(".")[:2]) for layer in unet_state_dict if "middle_block" in layer})
-  middle_blocks = {
-      layer_id: [key for key in unet_state_dict if f"middle_block.{layer_id}" in key]
-      for layer_id in range(num_middle_blocks)
-  }
-
-  # Retrieves the keys for the output blocks only
-  num_output_blocks = len({".".join(layer.split(".")[:2]) for layer in unet_state_dict if "output_blocks" in layer})
-  output_blocks = {
-      layer_id: [key for key in unet_state_dict if f"output_blocks.{layer_id}" in key]
-      for layer_id in range(num_output_blocks)
-  }
-
-  for i in range(1, num_input_blocks):
-    block_id = (i - 1) // (config["layers_per_block"] + 1)
-    layer_in_block_id = (i - 1) % (config["layers_per_block"] + 1)
-
-    resnets = [
-        key for key in input_blocks[i] if f"input_blocks.{i}.0" in key and f"input_blocks.{i}.0.op" not in key
-    ]
-    attentions = [key for key in input_blocks[i] if f"input_blocks.{i}.1" in key]
-
-    if f"input_blocks.{i}.0.op.weight" in unet_state_dict:
-      new_checkpoint[f"down_blocks.{block_id}.downsamplers.0.conv.weight"] = unet_state_dict.pop(
-          f"input_blocks.{i}.0.op.weight"
-      )
-      new_checkpoint[f"down_blocks.{block_id}.downsamplers.0.conv.bias"] = unet_state_dict.pop(
-          f"input_blocks.{i}.0.op.bias"
-      )
-
-    paths = renew_resnet_paths(resnets)
-    meta_path = {"old": f"input_blocks.{i}.0", "new": f"down_blocks.{block_id}.resnets.{layer_in_block_id}"}
-    assign_to_checkpoint(
-        paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
-    )
-
-    if len(attentions):
-      paths = renew_attention_paths(attentions)
-      meta_path = {"old": f"input_blocks.{i}.1", "new": f"down_blocks.{block_id}.attentions.{layer_in_block_id}"}
-      assign_to_checkpoint(
-          paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
-      )
-
-  resnet_0 = middle_blocks[0]
-  attentions = middle_blocks[1]
-  resnet_1 = middle_blocks[2]
-
-  resnet_0_paths = renew_resnet_paths(resnet_0)
-  assign_to_checkpoint(resnet_0_paths, new_checkpoint, unet_state_dict, config=config)
-
-  resnet_1_paths = renew_resnet_paths(resnet_1)
-  assign_to_checkpoint(resnet_1_paths, new_checkpoint, unet_state_dict, config=config)
-
-  attentions_paths = renew_attention_paths(attentions)
-  meta_path = {"old": "middle_block.1", "new": "mid_block.attentions.0"}
-  assign_to_checkpoint(
-      attentions_paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
-  )
-
-  for i in range(num_output_blocks):
-    block_id = i // (config["layers_per_block"] + 1)
-    layer_in_block_id = i % (config["layers_per_block"] + 1)
-    output_block_layers = [shave_segments(name, 2) for name in output_blocks[i]]
-    output_block_list = {}
-
-    for layer in output_block_layers:
-      layer_id, layer_name = layer.split(".")[0], shave_segments(layer, 1)
-      if layer_id in output_block_list:
-        output_block_list[layer_id].append(layer_name)
-      else:
-        output_block_list[layer_id] = [layer_name]
-
-    if len(output_block_list) > 1:
-      resnets = [key for key in output_blocks[i] if f"output_blocks.{i}.0" in key]
-      attentions = [key for key in output_blocks[i] if f"output_blocks.{i}.1" in key]
-
-      resnet_0_paths = renew_resnet_paths(resnets)
-      paths = renew_resnet_paths(resnets)
-
-      meta_path = {"old": f"output_blocks.{i}.0", "new": f"up_blocks.{block_id}.resnets.{layer_in_block_id}"}
-      assign_to_checkpoint(
-          paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
-      )
-
-      if ["conv.weight", "conv.bias"] in output_block_list.values():
-        index = list(output_block_list.values()).index(["conv.weight", "conv.bias"])
-        new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.weight"] = unet_state_dict[
-            f"output_blocks.{i}.{index}.conv.weight"
-        ]
-        new_checkpoint[f"up_blocks.{block_id}.upsamplers.0.conv.bias"] = unet_state_dict[
-            f"output_blocks.{i}.{index}.conv.bias"
-        ]
-
-        # Clear attentions as they have been attributed above.
-        if len(attentions) == 2:
-          attentions = []
-
-      if len(attentions):
-        paths = renew_attention_paths(attentions)
-        meta_path = {
-            "old": f"output_blocks.{i}.1",
-            "new": f"up_blocks.{block_id}.attentions.{layer_in_block_id}",
-        }
-        assign_to_checkpoint(
-            paths, new_checkpoint, unet_state_dict, additional_replacements=[meta_path], config=config
-        )
-    else:
-      resnet_0_paths = renew_resnet_paths(output_block_layers, n_shave_prefix_segments=1)
-      for path in resnet_0_paths:
-        old_path = ".".join(["output_blocks", str(i), path["old"]])
-        new_path = ".".join(["up_blocks", str(block_id), "resnets", str(layer_in_block_id), path["new"]])
-
-        new_checkpoint[new_path] = unet_state_dict[old_path]
-
-  # SDのv2では1*1のconv2dがlinearに変わっているので、linear->convに変換する
-  if v2:
-    linear_transformer_to_conv(new_checkpoint)
-
-  return new_checkpoint
-
-
-def convert_ldm_vae_checkpoint(checkpoint, config):
-  # extract state dict for VAE
-  vae_state_dict = {}
-  vae_key = "first_stage_model."
-  keys = list(checkpoint.keys())
-  for key in keys:
-    if key.startswith(vae_key):
-      vae_state_dict[key.replace(vae_key, "")] = checkpoint.get(key)
-
-  new_checkpoint = {}
-
-  new_checkpoint["encoder.conv_in.weight"] = vae_state_dict["encoder.conv_in.weight"]
-  new_checkpoint["encoder.conv_in.bias"] = vae_state_dict["encoder.conv_in.bias"]
-  new_checkpoint["encoder.conv_out.weight"] = vae_state_dict["encoder.conv_out.weight"]
-  new_checkpoint["encoder.conv_out.bias"] = vae_state_dict["encoder.conv_out.bias"]
-  new_checkpoint["encoder.conv_norm_out.weight"] = vae_state_dict["encoder.norm_out.weight"]
-  new_checkpoint["encoder.conv_norm_out.bias"] = vae_state_dict["encoder.norm_out.bias"]
-
-  new_checkpoint["decoder.conv_in.weight"] = vae_state_dict["decoder.conv_in.weight"]
-  new_checkpoint["decoder.conv_in.bias"] = vae_state_dict["decoder.conv_in.bias"]
-  new_checkpoint["decoder.conv_out.weight"] = vae_state_dict["decoder.conv_out.weight"]
-  new_checkpoint["decoder.conv_out.bias"] = vae_state_dict["decoder.conv_out.bias"]
-  new_checkpoint["decoder.conv_norm_out.weight"] = vae_state_dict["decoder.norm_out.weight"]
-  new_checkpoint["decoder.conv_norm_out.bias"] = vae_state_dict["decoder.norm_out.bias"]
-
-  new_checkpoint["quant_conv.weight"] = vae_state_dict["quant_conv.weight"]
-  new_checkpoint["quant_conv.bias"] = vae_state_dict["quant_conv.bias"]
-  new_checkpoint["post_quant_conv.weight"] = vae_state_dict["post_quant_conv.weight"]
-  new_checkpoint["post_quant_conv.bias"] = vae_state_dict["post_quant_conv.bias"]
-
-  # Retrieves the keys for the encoder down blocks only
-  num_down_blocks = len({".".join(layer.split(".")[:3]) for layer in vae_state_dict if "encoder.down" in layer})
-  down_blocks = {
-      layer_id: [key for key in vae_state_dict if f"down.{layer_id}" in key] for layer_id in range(num_down_blocks)
-  }
-
-  # Retrieves the keys for the decoder up blocks only
-  num_up_blocks = len({".".join(layer.split(".")[:3]) for layer in vae_state_dict if "decoder.up" in layer})
-  up_blocks = {
-      layer_id: [key for key in vae_state_dict if f"up.{layer_id}" in key] for layer_id in range(num_up_blocks)
-  }
-
-  for i in range(num_down_blocks):
-    resnets = [key for key in down_blocks[i] if f"down.{i}" in key and f"down.{i}.downsample" not in key]
-
-    if f"encoder.down.{i}.downsample.conv.weight" in vae_state_dict:
-      new_checkpoint[f"encoder.down_blocks.{i}.downsamplers.0.conv.weight"] = vae_state_dict.pop(
-          f"encoder.down.{i}.downsample.conv.weight"
-      )
-      new_checkpoint[f"encoder.down_blocks.{i}.downsamplers.0.conv.bias"] = vae_state_dict.pop(
-          f"encoder.down.{i}.downsample.conv.bias"
-      )
-
-    paths = renew_vae_resnet_paths(resnets)
-    meta_path = {"old": f"down.{i}.block", "new": f"down_blocks.{i}.resnets"}
-    assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-
-  mid_resnets = [key for key in vae_state_dict if "encoder.mid.block" in key]
-  num_mid_res_blocks = 2
-  for i in range(1, num_mid_res_blocks + 1):
-    resnets = [key for key in mid_resnets if f"encoder.mid.block_{i}" in key]
-
-    paths = renew_vae_resnet_paths(resnets)
-    meta_path = {"old": f"mid.block_{i}", "new": f"mid_block.resnets.{i - 1}"}
-    assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-
-  mid_attentions = [key for key in vae_state_dict if "encoder.mid.attn" in key]
-  paths = renew_vae_attention_paths(mid_attentions)
-  meta_path = {"old": "mid.attn_1", "new": "mid_block.attentions.0"}
-  assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-  conv_attn_to_linear(new_checkpoint)
-
-  for i in range(num_up_blocks):
-    block_id = num_up_blocks - 1 - i
-    resnets = [
-        key for key in up_blocks[block_id] if f"up.{block_id}" in key and f"up.{block_id}.upsample" not in key
-    ]
-
-    if f"decoder.up.{block_id}.upsample.conv.weight" in vae_state_dict:
-      new_checkpoint[f"decoder.up_blocks.{i}.upsamplers.0.conv.weight"] = vae_state_dict[
-          f"decoder.up.{block_id}.upsample.conv.weight"
-      ]
-      new_checkpoint[f"decoder.up_blocks.{i}.upsamplers.0.conv.bias"] = vae_state_dict[
-          f"decoder.up.{block_id}.upsample.conv.bias"
-      ]
-
-    paths = renew_vae_resnet_paths(resnets)
-    meta_path = {"old": f"up.{block_id}.block", "new": f"up_blocks.{i}.resnets"}
-    assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-
-  mid_resnets = [key for key in vae_state_dict if "decoder.mid.block" in key]
-  num_mid_res_blocks = 2
-  for i in range(1, num_mid_res_blocks + 1):
-    resnets = [key for key in mid_resnets if f"decoder.mid.block_{i}" in key]
-
-    paths = renew_vae_resnet_paths(resnets)
-    meta_path = {"old": f"mid.block_{i}", "new": f"mid_block.resnets.{i - 1}"}
-    assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-
-  mid_attentions = [key for key in vae_state_dict if "decoder.mid.attn" in key]
-  paths = renew_vae_attention_paths(mid_attentions)
-  meta_path = {"old": "mid.attn_1", "new": "mid_block.attentions.0"}
-  assign_to_checkpoint(paths, new_checkpoint, vae_state_dict, additional_replacements=[meta_path], config=config)
-  conv_attn_to_linear(new_checkpoint)
-  return new_checkpoint
-
-
-def create_unet_diffusers_config(v2):
-  """
-  Creates a config for the diffusers based on the config of the LDM model.
-  """
-  # unet_params = original_config.model.params.unet_config.params
-
-  block_out_channels = [UNET_PARAMS_MODEL_CHANNELS * mult for mult in UNET_PARAMS_CHANNEL_MULT]
-
-  down_block_types = []
-  resolution = 1
-  for i in range(len(block_out_channels)):
-    block_type = "CrossAttnDownBlock2D" if resolution in UNET_PARAMS_ATTENTION_RESOLUTIONS else "DownBlock2D"
-    down_block_types.append(block_type)
-    if i != len(block_out_channels) - 1:
-      resolution *= 2
-
-  up_block_types = []
-  for i in range(len(block_out_channels)):
-    block_type = "CrossAttnUpBlock2D" if resolution in UNET_PARAMS_ATTENTION_RESOLUTIONS else "UpBlock2D"
-    up_block_types.append(block_type)
-    resolution //= 2
-
-  config = dict(
-      sample_size=UNET_PARAMS_IMAGE_SIZE,
-      in_channels=UNET_PARAMS_IN_CHANNELS,
-      out_channels=UNET_PARAMS_OUT_CHANNELS,
-      down_block_types=tuple(down_block_types),
-      up_block_types=tuple(up_block_types),
-      block_out_channels=tuple(block_out_channels),
-      layers_per_block=UNET_PARAMS_NUM_RES_BLOCKS,
-      cross_attention_dim=UNET_PARAMS_CONTEXT_DIM if not v2 else V2_UNET_PARAMS_CONTEXT_DIM,
-      attention_head_dim=UNET_PARAMS_NUM_HEADS if not v2 else V2_UNET_PARAMS_ATTENTION_HEAD_DIM,
-  )
-
-  return config
-
-
-def create_vae_diffusers_config():
-  """
-  Creates a config for the diffusers based on the config of the LDM model.
-  """
-  # vae_params = original_config.model.params.first_stage_config.params.ddconfig
-  # _ = original_config.model.params.first_stage_config.params.embed_dim
-  block_out_channels = [VAE_PARAMS_CH * mult for mult in VAE_PARAMS_CH_MULT]
-  down_block_types = ["DownEncoderBlock2D"] * len(block_out_channels)
-  up_block_types = ["UpDecoderBlock2D"] * len(block_out_channels)
-
-  config = dict(
-      sample_size=VAE_PARAMS_RESOLUTION,
-      in_channels=VAE_PARAMS_IN_CHANNELS,
-      out_channels=VAE_PARAMS_OUT_CH,
-      down_block_types=tuple(down_block_types),
-      up_block_types=tuple(up_block_types),
-      block_out_channels=tuple(block_out_channels),
-      latent_channels=VAE_PARAMS_Z_CHANNELS,
-      layers_per_block=VAE_PARAMS_NUM_RES_BLOCKS,
-  )
-  return config
-
-
-def convert_ldm_clip_checkpoint_v1(checkpoint):
-  keys = list(checkpoint.keys())
-  text_model_dict = {}
-  for key in keys:
-    if key.startswith("cond_stage_model.transformer"):
-      text_model_dict[key[len("cond_stage_model.transformer."):]] = checkpoint[key]
-  return text_model_dict
-
-
-def convert_ldm_clip_checkpoint_v2(checkpoint, max_length):
-  # 嫌になるくらい違うぞ！
-  def convert_key(key):
-    if not key.startswith("cond_stage_model"):
-      return None
-
-    # common conversion
-    key = key.replace("cond_stage_model.model.transformer.", "text_model.encoder.")
-    key = key.replace("cond_stage_model.model.", "text_model.")
-
-    if "resblocks" in key:
-      # resblocks conversion
-      key = key.replace(".resblocks.", ".layers.")
-      if ".ln_" in key:
-        key = key.replace(".ln_", ".layer_norm")
-      elif ".mlp." in key:
-        key = key.replace(".c_fc.", ".fc1.")
-        key = key.replace(".c_proj.", ".fc2.")
-      elif '.attn.out_proj' in key:
-        key = key.replace(".attn.out_proj.", ".self_attn.out_proj.")
-      elif '.attn.in_proj' in key:
-        key = None                  # 特殊なので後で処理する
-      else:
-        raise ValueError(f"unexpected key in SD: {key}")
-    elif '.positional_embedding' in key:
-      key = key.replace(".positional_embedding", ".embeddings.position_embedding.weight")
-    elif '.text_projection' in key:
-      key = None    # 使われない???
-    elif '.logit_scale' in key:
-      key = None    # 使われない???
-    elif '.token_embedding' in key:
-      key = key.replace(".token_embedding.weight", ".embeddings.token_embedding.weight")
-    elif '.ln_final' in key:
-      key = key.replace(".ln_final", ".final_layer_norm")
-    return key
-
-  keys = list(checkpoint.keys())
-  new_sd = {}
-  for key in keys:
-    # remove resblocks 23
-    if '.resblocks.23.' in key:
-      continue
-    new_key = convert_key(key)
-    if new_key is None:
-      continue
-    new_sd[new_key] = checkpoint[key]
-
-  # attnの変換
-  for key in keys:
-    if '.resblocks.23.' in key:
-      continue
-    if '.resblocks' in key and '.attn.in_proj_' in key:
-      # 三つに分割
-      values = torch.chunk(checkpoint[key], 3)
-
-      key_suffix = ".weight" if "weight" in key else ".bias"
-      key_pfx = key.replace("cond_stage_model.model.transformer.resblocks.", "text_model.encoder.layers.")
-      key_pfx = key_pfx.replace("_weight", "")
-      key_pfx = key_pfx.replace("_bias", "")
-      key_pfx = key_pfx.replace(".attn.in_proj", ".self_attn.")
-      new_sd[key_pfx + "q_proj" + key_suffix] = values[0]
-      new_sd[key_pfx + "k_proj" + key_suffix] = values[1]
-      new_sd[key_pfx + "v_proj" + key_suffix] = values[2]
-
-  # position_idsの追加
-  new_sd["text_model.embeddings.position_ids"] = torch.Tensor([list(range(max_length))]).to(torch.int64)
-  return new_sd
-
-# endregion
-
-
-# region Diffusers->StableDiffusion の変換コード
-# convert_diffusers_to_original_stable_diffusion をコピーしている（ASL 2.0）
-
-def conv_transformer_to_linear(checkpoint):
-  keys = list(checkpoint.keys())
-  tf_keys = ["proj_in.weight", "proj_out.weight"]
-  for key in keys:
-    if ".".join(key.split(".")[-2:]) in tf_keys:
-      if checkpoint[key].ndim > 2:
-        checkpoint[key] = checkpoint[key][:, :, 0, 0]
-
-
-def convert_unet_state_dict_to_sd(v2, unet_state_dict):
-  unet_conversion_map = [
-      # (stable-diffusion, HF Diffusers)
-      ("time_embed.0.weight", "time_embedding.linear_1.weight"),
-      ("time_embed.0.bias", "time_embedding.linear_1.bias"),
-      ("time_embed.2.weight", "time_embedding.linear_2.weight"),
-      ("time_embed.2.bias", "time_embedding.linear_2.bias"),
-      ("input_blocks.0.0.weight", "conv_in.weight"),
-      ("input_blocks.0.0.bias", "conv_in.bias"),
-      ("out.0.weight", "conv_norm_out.weight"),
-      ("out.0.bias", "conv_norm_out.bias"),
-      ("out.2.weight", "conv_out.weight"),
-      ("out.2.bias", "conv_out.bias"),
-  ]
-
-  unet_conversion_map_resnet = [
-      # (stable-diffusion, HF Diffusers)
-      ("in_layers.0", "norm1"),
-      ("in_layers.2", "conv1"),
-      ("out_layers.0", "norm2"),
-      ("out_layers.3", "conv2"),
-      ("emb_layers.1", "time_emb_proj"),
-      ("skip_connection", "conv_shortcut"),
-  ]
-
-  unet_conversion_map_layer = []
-  for i in range(4):
-      # loop over downblocks/upblocks
-
-    for j in range(2):
-        # loop over resnets/attentions for downblocks
-      hf_down_res_prefix = f"down_blocks.{i}.resnets.{j}."
-      sd_down_res_prefix = f"input_blocks.{3*i + j + 1}.0."
-      unet_conversion_map_layer.append((sd_down_res_prefix, hf_down_res_prefix))
-
-      if i < 3:
-        # no attention layers in down_blocks.3
-        hf_down_atn_prefix = f"down_blocks.{i}.attentions.{j}."
-        sd_down_atn_prefix = f"input_blocks.{3*i + j + 1}.1."
-        unet_conversion_map_layer.append((sd_down_atn_prefix, hf_down_atn_prefix))
-
-    for j in range(3):
-      # loop over resnets/attentions for upblocks
-      hf_up_res_prefix = f"up_blocks.{i}.resnets.{j}."
-      sd_up_res_prefix = f"output_blocks.{3*i + j}.0."
-      unet_conversion_map_layer.append((sd_up_res_prefix, hf_up_res_prefix))
-
-      if i > 0:
-        # no attention layers in up_blocks.0
-        hf_up_atn_prefix = f"up_blocks.{i}.attentions.{j}."
-        sd_up_atn_prefix = f"output_blocks.{3*i + j}.1."
-        unet_conversion_map_layer.append((sd_up_atn_prefix, hf_up_atn_prefix))
-
-    if i < 3:
-      # no downsample in down_blocks.3
-      hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0.conv."
-      sd_downsample_prefix = f"input_blocks.{3*(i+1)}.0.op."
-      unet_conversion_map_layer.append((sd_downsample_prefix, hf_downsample_prefix))
-
-      # no upsample in up_blocks.3
-      hf_upsample_prefix = f"up_blocks.{i}.upsamplers.0."
-      sd_upsample_prefix = f"output_blocks.{3*i + 2}.{1 if i == 0 else 2}."
-      unet_conversion_map_layer.append((sd_upsample_prefix, hf_upsample_prefix))
-
-  hf_mid_atn_prefix = "mid_block.attentions.0."
-  sd_mid_atn_prefix = "middle_block.1."
-  unet_conversion_map_layer.append((sd_mid_atn_prefix, hf_mid_atn_prefix))
-
-  for j in range(2):
-    hf_mid_res_prefix = f"mid_block.resnets.{j}."
-    sd_mid_res_prefix = f"middle_block.{2*j}."
-    unet_conversion_map_layer.append((sd_mid_res_prefix, hf_mid_res_prefix))
-
-  # buyer beware: this is a *brittle* function,
-  # and correct output requires that all of these pieces interact in
-  # the exact order in which I have arranged them.
-  mapping = {k: k for k in unet_state_dict.keys()}
-  for sd_name, hf_name in unet_conversion_map:
-    mapping[hf_name] = sd_name
-  for k, v in mapping.items():
-    if "resnets" in k:
-      for sd_part, hf_part in unet_conversion_map_resnet:
-        v = v.replace(hf_part, sd_part)
-      mapping[k] = v
-  for k, v in mapping.items():
-    for sd_part, hf_part in unet_conversion_map_layer:
-      v = v.replace(hf_part, sd_part)
-    mapping[k] = v
-  new_state_dict = {v: unet_state_dict[k] for k, v in mapping.items()}
-
-  if v2:
-    conv_transformer_to_linear(new_state_dict)
-
-  return new_state_dict
-
-# endregion
-
-
-def load_checkpoint_with_text_encoder_conversion(ckpt_path):
-  # text encoderの格納形式が違うモデルに対応する ('text_model'がない)
-  TEXT_ENCODER_KEY_REPLACEMENTS = [
-      ('cond_stage_model.transformer.embeddings.', 'cond_stage_model.transformer.text_model.embeddings.'),
-      ('cond_stage_model.transformer.encoder.', 'cond_stage_model.transformer.text_model.encoder.'),
-      ('cond_stage_model.transformer.final_layer_norm.', 'cond_stage_model.transformer.text_model.final_layer_norm.')
-  ]
-
-  checkpoint = torch.load(ckpt_path, map_location="cuda")
-  state_dict = checkpoint["state_dict"]
-
-  key_reps = []
-  for rep_from, rep_to in TEXT_ENCODER_KEY_REPLACEMENTS:
-    for key in state_dict.keys():
-      if key.startswith(rep_from):
-        new_key = rep_to + key[len(rep_from):]
-        key_reps.append((key, new_key))
-
-  for key, new_key in key_reps:
-    state_dict[new_key] = state_dict[key]
-    del state_dict[key]
-
-  return checkpoint
-
-
-def load_models_from_stable_diffusion_checkpoint(v2, ckpt_path, dtype=None):
-  checkpoint = load_checkpoint_with_text_encoder_conversion(ckpt_path)
-  state_dict = checkpoint["state_dict"]
-  if dtype is not None:
-    for k, v in state_dict.items():
-      if type(v) is torch.Tensor:
-        state_dict[k] = v.to(dtype)
-
-  # Convert the UNet2DConditionModel model.
-  unet_config = create_unet_diffusers_config(v2)
-  converted_unet_checkpoint = convert_ldm_unet_checkpoint(v2, state_dict, unet_config)
-
-  unet = UNet2DConditionModel(**unet_config)
-  info = unet.load_state_dict(converted_unet_checkpoint)
-  print("loading u-net:", info)
-
-  # Convert the VAE model.
-  vae_config = create_vae_diffusers_config()
-  converted_vae_checkpoint = convert_ldm_vae_checkpoint(state_dict, vae_config)
-
-  vae = AutoencoderKL(**vae_config)
-  info = vae.load_state_dict(converted_vae_checkpoint)
-  print("loadint vae:", info)
-
-  # convert text_model
-  if v2:
-    converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint_v2(state_dict, 77)
-    cfg = CLIPTextConfig(
-        vocab_size=49408,
-        hidden_size=1024,
-        intermediate_size=4096,
-        num_hidden_layers=23,
-        num_attention_heads=16,
-        max_position_embeddings=77,
-        hidden_act="gelu",
-        layer_norm_eps=1e-05,
-        dropout=0.0,
-        attention_dropout=0.0,
-        initializer_range=0.02,
-        initializer_factor=1.0,
-        pad_token_id=1,
-        bos_token_id=0,
-        eos_token_id=2,
-        model_type="clip_text_model",
-        projection_dim=512,
-        torch_dtype="float32",
-        transformers_version="4.25.0.dev0",
-    )
-    text_model = CLIPTextModel._from_config(cfg)
-    info = text_model.load_state_dict(converted_text_encoder_checkpoint)
-  else:
-    converted_text_encoder_checkpoint = convert_ldm_clip_checkpoint_v1(state_dict)
-    text_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
-    info = text_model.load_state_dict(converted_text_encoder_checkpoint)
-  print("loading text encoder:", info)
-
-  return text_model, vae, unet
-
-
-def convert_text_encoder_state_dict_to_sd_v2(checkpoint):
-  def convert_key(key):
-    # position_idsの除去
-    if ".position_ids" in key:
-      return None
-
-    # common
-    key = key.replace("text_model.encoder.", "transformer.")
-    key = key.replace("text_model.", "")
-    if "layers" in key:
-      # resblocks conversion
-      key = key.replace(".layers.", ".resblocks.")
-      if ".layer_norm" in key:
-        key = key.replace(".layer_norm", ".ln_")
-      elif ".mlp." in key:
-        key = key.replace(".fc1.", ".c_fc.")
-        key = key.replace(".fc2.", ".c_proj.")
-      elif '.self_attn.out_proj' in key:
-        key = key.replace(".self_attn.out_proj.", ".attn.out_proj.")
-      elif '.self_attn.' in key:
-        key = None                  # 特殊なので後で処理する
-      else:
-        raise ValueError(f"unexpected key in DiffUsers model: {key}")
-    elif '.position_embedding' in key:
-      key = key.replace("embeddings.position_embedding.weight", "positional_embedding")
-    elif '.token_embedding' in key:
-      key = key.replace("embeddings.token_embedding.weight", "token_embedding.weight")
-    elif 'final_layer_norm' in key:
-      key = key.replace("final_layer_norm", "ln_final")
-    return key
-
-  keys = list(checkpoint.keys())
-  new_sd = {}
-  for key in keys:
-    new_key = convert_key(key)
-    if new_key is None:
-      continue
-    new_sd[new_key] = checkpoint[key]
-
-  # attnの変換
-  for key in keys:
-    if 'layers' in key and 'q_proj' in key:
-      # 三つを結合
-      key_q = key
-      key_k = key.replace("q_proj", "k_proj")
-      key_v = key.replace("q_proj", "v_proj")
-
-      value_q = checkpoint[key_q]
-      value_k = checkpoint[key_k]
-      value_v = checkpoint[key_v]
-      value = torch.cat([value_q, value_k, value_v])
-
-      new_key = key.replace("text_model.encoder.layers.", "transformer.resblocks.")
-      new_key = new_key.replace(".self_attn.q_proj.", ".attn.in_proj_")
-      new_sd[new_key] = value
-
-  return new_sd
-
-
-def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_path, epochs, steps, save_dtype=None):
-  # VAEがメモリ上にないので、もう一度VAEを含めて読み込む
-  checkpoint = load_checkpoint_with_text_encoder_conversion(ckpt_path)
-  state_dict = checkpoint["state_dict"]
-
-  def assign_new_sd(prefix, sd):
-    for k, v in sd.items():
-      key = prefix + k
-      assert key in state_dict, f"Illegal key in save SD: {key}"
-      if save_dtype is not None:
-        v = v.detach().clone().to("cpu").to(save_dtype)
-      state_dict[key] = v
-
-  # Convert the UNet model
-  unet_state_dict = convert_unet_state_dict_to_sd(v2, unet.state_dict())
-  assign_new_sd("model.diffusion_model.", unet_state_dict)
-
-  # Convert the text encoder model
-  if v2:
-    text_enc_dict = convert_text_encoder_state_dict_to_sd_v2(text_encoder.state_dict())
-    assign_new_sd("cond_stage_model.model.", text_enc_dict)
-  else:
-    text_enc_dict = text_encoder.state_dict()
-    assign_new_sd("cond_stage_model.transformer.", text_enc_dict)
-
-  # Put together new checkpoint
-  new_ckpt = {'state_dict': state_dict}
-
-  if 'epoch' in checkpoint:
-    epochs += checkpoint['epoch']
-  if 'global_step' in checkpoint:
-    steps += checkpoint['global_step']
-
-  new_ckpt['epoch'] = epochs
-  new_ckpt['global_step'] = steps
-
-  torch.save(new_ckpt, output_file)
-
-
-def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_model_name_or_path, save_dtype):
-  pipeline = StableDiffusionPipeline(
-      unet=unet,
-      text_encoder=text_encoder,
-      vae=AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae"),
-      scheduler=DDIMScheduler.from_pretrained(pretrained_model_name_or_path, subfolder="scheduler"),
-      tokenizer=CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer"),
-      safety_checker=None,
-      feature_extractor=None,
-      requires_safety_checker=None,
-  )
-  pipeline.save_pretrained(output_dir)
-
-# endregion
-
 
 # region モジュール入れ替え部
 """
@@ -1322,6 +460,9 @@ class PipelineLike():
       clip_model: CLIPModel,
       clip_guidance_scale: float,
       clip_image_guidance_scale: float,
+      vgg16_model: torchvision.models.VGG,
+      vgg16_guidance_scale: float,
+      vgg16_layer_no: int,
       # safety_checker: StableDiffusionSafetyChecker,
       # feature_extractor: CLIPFeatureExtractor,
   ):
@@ -1369,6 +510,13 @@ class PipelineLike():
     self.clip_model = clip_model
     self.normalize = transforms.Normalize(mean=FEATURE_EXTRACTOR_IMAGE_MEAN, std=FEATURE_EXTRACTOR_IMAGE_STD)
     self.make_cutouts = MakeCutouts(FEATURE_EXTRACTOR_SIZE)
+
+    # VGG16 guidance
+    self.vgg16_guidance_scale = vgg16_guidance_scale
+    if self.vgg16_guidance_scale > 0.0:
+      return_layers = {f'{vgg16_layer_no}': 'feat'}
+      self.vgg16_feat_model = torchvision.models._utils.IntermediateLayerGetter(vgg16_model.features, return_layers=return_layers)
+      self.vgg16_normalize = transforms.Normalize(mean=VGG16_IMAGE_MEAN, std=VGG16_IMAGE_STD)
 
 # region xformersとか使う部分：独自に書き換えるので関係なし
   def enable_xformers_memory_efficient_attention(self):
@@ -1602,18 +750,25 @@ class PipelineLike():
 
       text_embeddings_clip = self.clip_model.get_text_features(clip_text_input)
       text_embeddings_clip = text_embeddings_clip / text_embeddings_clip.norm(p=2, dim=-1, keepdim=True)      # prompt複数件でもOK
-    if self.clip_image_guidance_scale > 0:
+
+    if self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
       if isinstance(clip_guide_images, PIL.Image.Image):
         clip_guide_images = [clip_guide_images]
       clip_guide_images = [preprocess_guide_image(im) for im in clip_guide_images]
       clip_guide_images = torch.cat(clip_guide_images, dim=0)
-      clip_guide_images = self.normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
 
-      image_embeddings_clip = self.clip_model.get_image_features(clip_guide_images)
-      image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
-
-      if len(image_embeddings_clip) == 1:
-        image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
+      if self.clip_image_guidance_scale > 0:
+        clip_guide_images = self.normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
+        image_embeddings_clip = self.clip_model.get_image_features(clip_guide_images)
+        image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
+        if len(image_embeddings_clip) == 1:
+          image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
+      else:
+        clip_guide_images = self.vgg16_normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
+        image_embeddings_vgg16 = self.vgg16_feat_model(clip_guide_images)['feat']
+        print(len(image_embeddings_vgg16))
+        if len(image_embeddings_vgg16) == 1:
+          image_embeddings_vgg16 = image_embeddings_vgg16.repeat((batch_size, 1, 1, 1))
 
     # set timesteps
     self.scheduler.set_timesteps(num_inference_steps)
@@ -1674,7 +829,7 @@ class PipelineLike():
       if mask_image is not None:
         mask = mask_image.to(device=self.device, dtype=latents_dtype)
         if len(mask) == 1:
-          mask = mask.repeats((batch_size, 1, 1, 1))
+          mask = mask.repeat((batch_size, 1, 1, 1))
 
         # check sizes
         if not mask.shape == init_latents.shape:
@@ -1717,22 +872,25 @@ class PipelineLike():
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
       # perform clip guidance
-      if self.clip_guidance_scale > 0 or self.clip_image_guidance_scale > 0:
+      if self.clip_guidance_scale > 0 or self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0:
         text_embeddings_for_guidance = (text_embeddings.chunk(2)[1] if do_classifier_free_guidance else text_embeddings)
 
         if self.clip_guidance_scale > 0:
           noise_pred, latents = self.cond_fn(latents, t, i, text_embeddings_for_guidance, noise_pred,
                                              text_embeddings_clip, self.clip_guidance_scale, NUM_CUTOUTS, USE_CUTOUTS,)
-        if self.clip_image_guidance_scale > 0:
+        if self.clip_image_guidance_scale > 0 and clip_guide_images is not None:
           noise_pred, latents = self.cond_fn(latents, t, i, text_embeddings_for_guidance, noise_pred,
                                              image_embeddings_clip, self.clip_image_guidance_scale, NUM_CUTOUTS, USE_CUTOUTS,)
+        if self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
+          noise_pred, latents = self.cond_fn_vgg16(latents, t, i, text_embeddings_for_guidance, noise_pred,
+                                                   image_embeddings_vgg16, self.vgg16_guidance_scale)
 
       # compute the previous noisy sample x_t -> x_t-1
       latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
       if mask is not None:
         # masking
-        init_latents_proper = self.scheduler.add_noise(init_latents_orig, noise, torch.tensor([t]))
+        init_latents_proper = self.scheduler.add_noise(init_latents_orig, img2img_noise, torch.tensor([t]))
         latents = (init_latents_proper * mask) + (latents * (1 - mask))
 
       # call the callback, if provided
@@ -2054,9 +1212,31 @@ class PipelineLike():
   # CLIP guidance StableDiffusion
   # copy from https://github.com/huggingface/diffusers/blob/main/examples/community/clip_guided_stable_diffusion.py
 
-  @torch.enable_grad()
+  # バッチを分解して1件ずつ処理する
   def cond_fn(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
               num_cutouts, use_cutouts=True, ):
+    if len(latents) == 1:
+      return self.cond_fn1(latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
+                           num_cutouts, use_cutouts)
+
+    noise_pred = []
+    cond_latents = []
+    for i in range(len(latents)):
+      lat1 = latents[i].unsqueeze(0)
+      tem1 = text_embeddings[i].unsqueeze(0)
+      npo1 = noise_pred_original[i].unsqueeze(0)
+      gem1 = guide_embeddings_clip[i].unsqueeze(0)
+      npr1, cla1 = self.cond_fn1(lat1, timestep, index, tem1, npo1, gem1, clip_guidance_scale, num_cutouts, use_cutouts)
+      noise_pred.append(npr1)
+      cond_latents.append(cla1)
+
+    noise_pred = torch.cat(noise_pred)
+    cond_latents = torch.cat(cond_latents)
+    return noise_pred, cond_latents
+
+  @torch.enable_grad()
+  def cond_fn1(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings_clip, clip_guidance_scale,
+               num_cutouts, use_cutouts=True, ):
     latents = latents.detach().requires_grad_()
 
     if isinstance(self.scheduler, LMSDiscreteScheduler):
@@ -2102,10 +1282,80 @@ class PipelineLike():
       dists = dists.view([num_cutouts, sample.shape[0], -1])
       loss = dists.sum(2).mean(0).sum() * clip_guidance_scale
     else:
+      # バッチサイズが複数だと正しく動くかわからない
       loss = spherical_dist_loss(image_embeddings_clip, guide_embeddings_clip).mean() * clip_guidance_scale
 
     grads = -torch.autograd.grad(loss, latents)[0]
 
+    if isinstance(self.scheduler, LMSDiscreteScheduler):
+      latents = latents.detach() + grads * (sigma**2)
+      noise_pred = noise_pred_original
+    else:
+      noise_pred = noise_pred_original - torch.sqrt(beta_prod_t) * grads
+    return noise_pred, latents
+
+  # バッチを分解して一件ずつ処理する
+  def cond_fn_vgg16(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
+    if len(latents) == 1:
+      return self.cond_fn_vgg16_b1(latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale)
+
+    noise_pred = []
+    cond_latents = []
+    for i in range(len(latents)):
+      lat1 = latents[i].unsqueeze(0)
+      tem1 = text_embeddings[i].unsqueeze(0)
+      npo1 = noise_pred_original[i].unsqueeze(0)
+      gem1 = guide_embeddings[i].unsqueeze(0)
+      npr1, cla1 = self.cond_fn_vgg16_b1(lat1, timestep, index, tem1, npo1, gem1, guidance_scale)
+      noise_pred.append(npr1)
+      cond_latents.append(cla1)
+
+    noise_pred = torch.cat(noise_pred)
+    cond_latents = torch.cat(cond_latents)
+    return noise_pred, cond_latents
+
+  # 1件だけ処理する
+  @torch.enable_grad()
+  def cond_fn_vgg16_b1(self, latents, timestep, index, text_embeddings, noise_pred_original, guide_embeddings, guidance_scale):
+    latents = latents.detach().requires_grad_()
+
+    if isinstance(self.scheduler, LMSDiscreteScheduler):
+      sigma = self.scheduler.sigmas[index]
+      # the model input needs to be scaled to match the continuous ODE formulation in K-LMS
+      latent_model_input = latents / ((sigma**2 + 1) ** 0.5)
+    else:
+      latent_model_input = latents
+
+    # predict the noise residual
+    noise_pred = self.unet(latent_model_input, timestep, encoder_hidden_states=text_embeddings).sample
+
+    if isinstance(self.scheduler, (PNDMScheduler, DDIMScheduler)):
+      alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
+      beta_prod_t = 1 - alpha_prod_t
+      # compute predicted original sample from predicted noise also called
+      # "predicted x_0" of formula (12) from https://arxiv.org/pdf/2010.02502.pdf
+      pred_original_sample = (latents - beta_prod_t ** (0.5) * noise_pred) / alpha_prod_t ** (0.5)
+
+      fac = torch.sqrt(beta_prod_t)
+      sample = pred_original_sample * (fac) + latents * (1 - fac)
+    elif isinstance(self.scheduler, LMSDiscreteScheduler):
+      sigma = self.scheduler.sigmas[index]
+      sample = latents - sigma * noise_pred
+    else:
+      raise ValueError(f"scheduler type {type(self.scheduler)} not supported")
+
+    sample = 1 / 0.18215 * sample
+    image = self.vae.decode(sample).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = transforms.Resize(FEATURE_EXTRACTOR_SIZE)(image)
+    image = self.vgg16_normalize(image).to(latents.dtype)
+
+    image_embeddings = self.vgg16_feat_model(image)['feat']
+
+    # バッチサイズが複数だと正しく動くかわからない
+    loss = ((image_embeddings - guide_embeddings) ** 2).mean() * guidance_scale       # MSE style transferでコンテンツの損失はMSEなので
+
+    grads = -torch.autograd.grad(loss, latents)[0]
     if isinstance(self.scheduler, LMSDiscreteScheduler):
       latents = latents.detach() + grads * (sigma**2)
       noise_pred = noise_pred_original
@@ -2537,50 +1787,11 @@ def preprocess_mask(mask):
 
 # endregion
 
-VAE_PREFIX = "first_stage_model."
 
-
-def load_vae(vae, dtype):
-  print(f"load VAE: {vae}")
-  if os.path.isdir(vae) or not os.path.isfile(vae):
-    # Diffusers
-    if not os.path.isdir(vae):      # load from Hugging Face
-      subfolder = "vae"
-    else:
-      subfolder = None
-    vae = AutoencoderKL.from_pretrained(vae, subfolder=subfolder, torch_dtype=dtype)
-    return vae
-
-  vae_config = create_vae_diffusers_config()
-
-  if vae.endswith(".bin"):
-    # SD 1.5 VAE on Huggingface
-    vae_sd = torch.load(vae, map_location="cuda")
-    converted_vae_checkpoint = vae_sd
-  else:
-    # StableDiffusion
-    vae_model = torch.load(vae, map_location="cuda")
-    vae_sd = vae_model['state_dict']
-
-    # vae only or full model
-    full_model = False
-    for vae_key in vae_sd:
-      if vae_key.startswith(VAE_PREFIX):
-        full_model = True
-        break
-    if not full_model:
-      sd = {}
-      for key, value in vae_sd.items():
-        sd[VAE_PREFIX + key] = value
-      vae_sd = sd
-      del sd
-
-    # Convert the VAE model.
-    converted_vae_checkpoint = convert_ldm_vae_checkpoint(vae_sd, vae_config)
-
-  vae = AutoencoderKL(**vae_config)
-  vae.load_state_dict(converted_vae_checkpoint)
-  return vae
+# def load_clip_l14_336(dtype):
+#   print(f"loading CLIP: {CLIP_ID_L14_336}")
+#   text_encoder = CLIPTextModel.from_pretrained(CLIP_ID_L14_336, torch_dtype=dtype)
+#   return text_encoder
 
 
 def main(args):
@@ -2606,7 +1817,7 @@ def main(args):
   use_stable_diffusion_format = os.path.isfile(args.ckpt)
   if use_stable_diffusion_format:
     print("load StableDiffusion checkpoint")
-    text_encoder, vae, unet = load_models_from_stable_diffusion_checkpoint(args.v2, args.ckpt)
+    text_encoder, vae, unet = model_util.load_models_from_stable_diffusion_checkpoint(args.v2, args.ckpt)
   else:
     print("load Diffusers pretrained models")
     pipe = StableDiffusionPipeline.from_pretrained(args.ckpt, safety_checker=None, torch_dtype=dtype)
@@ -2618,14 +1829,25 @@ def main(args):
 
   # VAEを読み込む
   if args.vae is not None:
-    vae = load_vae(args.vae, dtype)
+    vae = model_util.load_vae(args.vae, dtype)
     print("additional VAE loaded")
+
+  # # 置換するCLIPを読み込む
+  # if args.replace_clip_l14_336:
+  #   text_encoder = load_clip_l14_336(dtype)
+  #   print(f"large clip {CLIP_ID_L14_336} is loaded")
 
   if args.clip_guidance_scale > 0.0 or args.clip_image_guidance_scale:
     print("prepare clip model")
     clip_model = CLIPModel.from_pretrained(CLIP_MODEL_PATH, torch_dtype=dtype)
   else:
     clip_model = None
+
+  if args.vgg16_guidance_scale > 0.0:
+    print("prepare resnet model")
+    vgg16_model = torchvision.models.vgg16(torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+  else:
+    vgg16_model = None
 
   # xformers、Hypernetwork対応
   if not args.diffusers_xformers:
@@ -2732,6 +1954,10 @@ def main(args):
   scheduler = scheduler_cls(num_train_timesteps=SCHEDULER_TIMESTEPS,
                             beta_start=SCHEDULER_LINEAR_START, beta_end=SCHEDULER_LINEAR_END,
                             beta_schedule=SCHEDLER_SCHEDULE, **sched_init_args)
+  # clip_sample=Trueにする
+  if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is False:
+    print("set clip_sample to True")
+    scheduler.config.clip_sample = True
 
   # custom pipelineをコピったやつを生成する
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")             # "mps"を考量してない
@@ -2740,6 +1966,8 @@ def main(args):
   unet.to(dtype).to(device)
   if clip_model is not None:
     clip_model.to(dtype).to(device)
+  if vgg16_model is not None:
+    vgg16_model.to(dtype).to(device)
 
   if hypernetwork is not None:
     hypernetwork.to(dtype).to(device)
@@ -2755,9 +1983,12 @@ def main(args):
       clip_model.to(memory_format=torch.channels_last)
     if hypernetwork is not None:
       hypernetwork.to(memory_format=torch.channels_last)
+    if vgg16_model is not None:
+      vgg16_model.to(memory_format=torch.channels_last)
 
   pipe = PipelineLike(device, vae, text_encoder, tokenizer, unet, scheduler, args.clip_skip,
-                      clip_model, args.clip_guidance_scale, args.clip_image_guidance_scale)
+                      clip_model, args.clip_guidance_scale, args.clip_image_guidance_scale,
+                      vgg16_model, args.vgg16_guidance_scale, args.vgg16_guidance_layer)
   print("pipeline is ready.")
 
   if args.diffusers_xformers:
@@ -2850,11 +2081,14 @@ def main(args):
       print(f"resize img2img mask images to {args.W}*{args.H}")
       mask_images = resize_images(mask_images, (args.W, args.H))
 
+  prev_image = None               # for VGG16 guided
   if args.guide_image_path is not None:
-    print(f"load image for CLIP guidance: {args.guide_image_path}")
+    print(f"load image for CLIP/VGG16 guidance: {args.guide_image_path}")
     guide_images = load_images(args.guide_image_path)
-    assert len(guide_images) > 0, f"No guide image / ガイド画像がありません: {args.image_path}"
-    print(f"loaded {len(guide_images)} guide images for CLIP guidance")
+    print(f"loaded {len(guide_images)} guide images for CLIP/VGG16 guidance")
+    if len(guide_images) == 0:
+      print(f"No guide image, use previous generated image. / ガイド画像がありません。直前に生成した画像を使います: {args.image_path}")
+      guide_images = None
   else:
     guide_images = None
 
@@ -3053,50 +2287,50 @@ def main(args):
 
       for parg in prompt_args[1:]:
         try:
-          m = re.match(r'w (\d+)', parg)
+          m = re.match(r'w (\d+)', parg, re.IGNORECASE)
           if m:
             width = int(m.group(1))
             print(f"width: {width}")
             continue
 
-          m = re.match(r'h (\d+)', parg)
+          m = re.match(r'h (\d+)', parg, re.IGNORECASE)
           if m:
             height = int(m.group(1))
             print(f"height: {height}")
             continue
 
-          m = re.match(r's (\d+)', parg)
+          m = re.match(r's (\d+)', parg, re.IGNORECASE)
           if m:               # steps
             steps = max(1, min(1000, int(m.group(1))))
             print(f"steps: {steps}")
             continue
 
-          m = re.match(r'd ([\d,]+)', parg)
+          m = re.match(r'd ([\d,]+)', parg, re.IGNORECASE)
           if m:               # seed
             seeds = [int(d) for d in m.group(1).split(',')]
             print(f"seeds: {seeds}")
             continue
 
-          m = re.match(r'l ([\d\.]+)', parg)
+          m = re.match(r'l ([\d\.]+)', parg, re.IGNORECASE)
           if m:               # scale
             scale = float(m.group(1))
             print(f"scale: {scale}")
             continue
 
-          m = re.match(r't ([\d\.]+)', parg)
+          m = re.match(r't ([\d\.]+)', parg, re.IGNORECASE)
           if m:               # strength
             strength = float(m.group(1))
             print(f"strength: {strength}")
             continue
 
-          m = re.match(r'n (.+)', parg)
+          m = re.match(r'n (.+)', parg, re.IGNORECASE)
           if m:               # negative prompt
             negative_prompt = m.group(1)
             print(f"negative prompt: {negative_prompt}")
             continue
 
-          m = re.match(r'c (.+)', parg)
-          if m:               # negative prompt
+          m = re.match(r'c (.+)', parg, re.IGNORECASE)
+          if m:               # clip prompt
             clip_prompt = m.group(1)
             print(f"clip prompt: {clip_prompt}")
             continue
@@ -3136,6 +2370,12 @@ def main(args):
 
         if guide_images is not None:
           guide_image = guide_images[global_step % len(guide_images)]
+        elif args.clip_image_guidance_scale > 0 or args.vgg16_guidance_scale > 0:
+          if prev_image is None:
+            print("Generate 1st image without guide image.")
+          else:
+            print("Use previous image as guide image.")
+            guide_image = prev_image
 
         b1 = ((global_step, prompt, negative_prompt, seed, init_image, mask_image, clip_prompt, guide_image),
               (width, height, steps, scale, strength))
@@ -3145,7 +2385,7 @@ def main(args):
 
         batch_data.append(b1)
         if len(batch_data) == args.batch_size:
-          process_batch(batch_data, highres_fix)
+          prev_image = process_batch(batch_data, highres_fix)[0]
           batch_data.clear()
 
         global_step += 1
@@ -3189,6 +2429,8 @@ if __name__ == '__main__':
   parser.add_argument("--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ")
   parser.add_argument("--vae", type=str, default=None,
                       help="path to checkpoint of vae to replace / VAEを入れ替える場合、VAEのcheckpointファイルまたはディレクトリ")
+  # parser.add_argument("--replace_clip_l14_336", action='store_true',
+  #                     help="Replace CLIP (Text Encoder) to l/14@336 / CLIP(Text Encoder)をl/14@336に入れ替える")
   parser.add_argument("--seed", type=int, default=None,
                       help="seed, or seed of seeds in multiple generation / 1枚生成時のseed、または複数枚生成時の乱数seedを決めるためのseed")
   parser.add_argument("--fp16", action='store_true', help='use fp16 / fp16を指定し省メモリ化する')
@@ -3208,6 +2450,10 @@ if __name__ == '__main__':
                       help='enable CLIP guided SD, scale for guidance (DDIM, PNDM, LMS samplers only) / CLIP guided SDを有効にしてこのscaleを適用する（サンプラーはDDIM、PNDM、LMSのみ）')
   parser.add_argument("--clip_image_guidance_scale", type=float, default=0.0,
                       help='enable CLIP guided SD by image, scale for guidance / 画像によるCLIP guided SDを有効にしてこのscaleを適用する')
+  parser.add_argument("--vgg16_guidance_scale", type=float, default=0.0,
+                      help='enable VGG16 guided SD by image, scale for guidance / 画像によるVGG16 guided SDを有効にしてこのscaleを適用する')
+  parser.add_argument("--vgg16_guidance_layer", type=int, default=20,
+                      help='layer of VGG16 to calculate contents guide (1~30, 20 for conv4_2) / VGG16のcontents guideに使うレイヤー番号 (1~30、20はconv4_2)')
   parser.add_argument("--guide_image_path", type=str, default=None, help="image to CLIP guidance / CLIP guided SDでガイドに使う画像")
   parser.add_argument("--highres_fix_scale", type=float, default=None,
                       help="enable highres fix, reso scale for 1st stage / highres fixを有効にして最初の解像度をこのscaleにする")
