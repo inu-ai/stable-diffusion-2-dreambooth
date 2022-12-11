@@ -813,7 +813,7 @@ def convert_vae_state_dict(vae_state_dict):
 
 # endregion
 
-# region 自作のモデル読み書き
+# region 自作のモデル読み書きなど
 
 def is_safetensors(path):
   return os.path.splitext(path)[1].lower() == '.safetensors'
@@ -991,6 +991,8 @@ def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_p
       strict = False
     else:
       strict = True
+    if "state_dict" in state_dict:
+      del state_dict["state_dict"]
   else:
     # 新しく作る
     checkpoint = {}
@@ -1036,6 +1038,7 @@ def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_p
   new_ckpt['global_step'] = steps
 
   if is_safetensors(output_file):
+    # TODO Tensor以外のdictの値を削除したほうがいいか
     save_file(state_dict, output_file)
   else:
     torch.save(new_ckpt, output_file)
@@ -1043,7 +1046,7 @@ def save_stable_diffusion_checkpoint(v2, output_file, text_encoder, unet, ckpt_p
   return key_count
 
 
-def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_model_name_or_path, vae=None):
+def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_model_name_or_path, vae=None, use_safetensors=False):
   if vae is None:
     vae = AutoencoderKL.from_pretrained(pretrained_model_name_or_path, subfolder="vae")
   pipeline = StableDiffusionPipeline(
@@ -1056,7 +1059,7 @@ def save_diffusers_checkpoint(v2, output_dir, text_encoder, unet, pretrained_mod
       feature_extractor=None,
       requires_safety_checker=None,
   )
-  pipeline.save_pretrained(output_dir)
+  pipeline.save_pretrained(output_dir, safe_serialization=use_safetensors)
 
 
 VAE_PREFIX = "first_stage_model."
@@ -1113,6 +1116,7 @@ def get_epoch_ckpt_name(use_safetensors, epoch):
 
 def get_last_ckpt_name(use_safetensors):
   return f"last" + (".safetensors" if use_safetensors else ".ckpt")
+
 
 # endregion
 

@@ -5,6 +5,8 @@
 # v4: SD2.0 support (new U-Net/text encoder/tokenizer), simplify by DiffUsers 0.9.0, no_preview in interactive mode
 # v5: fix clip_sample=True for scheduler, add VGG guidance
 # v6: refactor to use model util, load VAE without vae folder, support safe tensors
+# v7: add use_original_file_name and iter_same_seed option, change vgg16 guide input image size, 
+# Diffusers 0.10.0 (support new schedulers (dpm_2, dpm_2_a, heun, dpmsingle), supports all scheduler in v-prediction)
 
 # Copyright 2022 kohya_ss @kohya_ss
 #
@@ -95,8 +97,9 @@ import numpy as np
 import torch
 import torchvision
 from diffusers import (AutoencoderKL, DDPMScheduler,
-                       EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler,
-                       LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, EulerDiscreteScheduler,
+                       EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler, DPMSolverSinglestepScheduler,
+                       LMSDiscreteScheduler, PNDMScheduler, DDIMScheduler, EulerDiscreteScheduler, HeunDiscreteScheduler,
+                       KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler,
                        UNet2DConditionModel, StableDiffusionPipeline)
 from einops import rearrange
 from torch import einsum
@@ -135,6 +138,7 @@ FEATURE_EXTRACTOR_IMAGE_STD = [0.26862954, 0.26130258, 0.27577711]
 
 VGG16_IMAGE_MEAN = [0.485, 0.456, 0.406]
 VGG16_IMAGE_STD = [0.229, 0.224, 0.225]
+VGG16_INPUT_RESIZE_DIV = 4
 
 # CLIP特徴量の取得時にcutoutを使うか：使う場合にはソースを書き換えてください
 NUM_CUTOUTS = 4
@@ -357,10 +361,6 @@ def replace_unet_cross_attn_to_memory_efficient():
 
     out = rearrange(out, 'b h n d -> b n (h d)')
 
-    # diffusers 0.6.0
-    if type(self.to_out) is torch.nn.Sequential:
-      return self.to_out(out)
-
     # diffusers 0.7.0~
     out = self.to_out[0](out)
     out = self.to_out[1](out)
@@ -403,10 +403,6 @@ def replace_unet_cross_attn_to_xformers():
     out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None)        # 最適なのを選んでくれる
 
     out = rearrange(out, 'b n h d -> b n (h d)', h=h)
-
-    # diffusers 0.6.0
-    if type(self.to_out) is torch.nn.Sequential:
-      return self.to_out(out)
 
     # diffusers 0.7.0~
     out = self.to_out[0](out)
@@ -754,24 +750,28 @@ class PipelineLike():
     if self.clip_image_guidance_scale > 0 or self.vgg16_guidance_scale > 0 and clip_guide_images is not None:
       if isinstance(clip_guide_images, PIL.Image.Image):
         clip_guide_images = [clip_guide_images]
-      clip_guide_images = [preprocess_guide_image(im) for im in clip_guide_images]
-      clip_guide_images = torch.cat(clip_guide_images, dim=0)
 
       if self.clip_image_guidance_scale > 0:
+        clip_guide_images = [preprocess_guide_image(im) for im in clip_guide_images]
+        clip_guide_images = torch.cat(clip_guide_images, dim=0)
+
         clip_guide_images = self.normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
         image_embeddings_clip = self.clip_model.get_image_features(clip_guide_images)
         image_embeddings_clip = image_embeddings_clip / image_embeddings_clip.norm(p=2, dim=-1, keepdim=True)
         if len(image_embeddings_clip) == 1:
           image_embeddings_clip = image_embeddings_clip.repeat((batch_size, 1, 1, 1))
       else:
+        size = (width // VGG16_INPUT_RESIZE_DIV, height // VGG16_INPUT_RESIZE_DIV)            # とりあえず1/4に（小さいか?）
+        clip_guide_images = [preprocess_vgg16_guide_image(im, size) for im in clip_guide_images]
+        clip_guide_images = torch.cat(clip_guide_images, dim=0)
+
         clip_guide_images = self.vgg16_normalize(clip_guide_images).to(self.device).to(text_embeddings.dtype)
         image_embeddings_vgg16 = self.vgg16_feat_model(clip_guide_images)['feat']
-        print(len(image_embeddings_vgg16))
         if len(image_embeddings_vgg16) == 1:
           image_embeddings_vgg16 = image_embeddings_vgg16.repeat((batch_size, 1, 1, 1))
 
     # set timesteps
-    self.scheduler.set_timesteps(num_inference_steps)
+    self.scheduler.set_timesteps(num_inference_steps, self.device)
 
     latents_dtype = text_embeddings.dtype
     init_latents_orig = None
@@ -1347,7 +1347,7 @@ class PipelineLike():
     sample = 1 / 0.18215 * sample
     image = self.vae.decode(sample).sample
     image = (image / 2 + 0.5).clamp(0, 1)
-    image = transforms.Resize(FEATURE_EXTRACTOR_SIZE)(image)
+    image = transforms.Resize((image.shape[-2] // VGG16_INPUT_RESIZE_DIV, image.shape[-1] // VGG16_INPUT_RESIZE_DIV))(image)
     image = self.vgg16_normalize(image).to(latents.dtype)
 
     image_embeddings = self.vgg16_feat_model(image)['feat']
@@ -1755,9 +1755,18 @@ def get_weighted_text_embeddings(
 
 
 def preprocess_guide_image(image):
-  image = image.resize(FEATURE_EXTRACTOR_SIZE, resample=PIL.Image.LANCZOS)
+  image = image.resize(FEATURE_EXTRACTOR_SIZE, resample=Image.NEAREST)        # cond_fnと合わせる
   image = np.array(image).astype(np.float32) / 255.0
-  image = image[None].transpose(0, 3, 1, 2)
+  image = image[None].transpose(0, 3, 1, 2)       # nchw
+  image = torch.from_numpy(image)
+  return image                              # 0 to 1
+
+
+# VGG16の入力は任意サイズでよいので入力画像を適宜リサイズする
+def preprocess_vgg16_guide_image(image, size):
+  image = image.resize(size, resample=Image.NEAREST)        # cond_fnと合わせる
+  image = np.array(image).astype(np.float32) / 255.0
+  image = image[None].transpose(0, 3, 1, 2)       # nchw
   image = torch.from_numpy(image)
   return image                              # 0 to 1
 
@@ -1804,9 +1813,6 @@ def main(args):
 
   highres_fix = args.highres_fix_scale is not None
   assert not highres_fix or args.image_path is None, f"highres_fix doesn't work with img2img / highres_fixはimg2imgと同時に使えません"
-
-  assert not args.v2 or (args.sampler in ['ddim', 'euler', 'k_euler']
-                         ), f"only ddim/euler supported for SDv2 / SDv2ではsamplerはddimかeulerしか使えません"
 
   if args.v_parameterization and not args.v2:
     print("v_parameterization should be with v2 / v1でv_parameterizationを使用することは想定されていません")
@@ -1882,6 +1888,7 @@ def main(args):
 
   # schedulerを用意する
   sched_init_args = {}
+  scheduler_num_noises_per_step = 1
   if args.sampler == "ddim":
     scheduler_cls = DDIMScheduler
     scheduler_module = diffusers.schedulers.scheduling_ddim
@@ -1904,6 +1911,19 @@ def main(args):
     scheduler_cls = DPMSolverMultistepScheduler
     sched_init_args['algorithm_type'] = args.sampler
     scheduler_module = diffusers.schedulers.scheduling_dpmsolver_multistep
+  elif args.sampler == "dpmsingle":
+    scheduler_cls = DPMSolverSinglestepScheduler
+    scheduler_module = diffusers.schedulers.scheduling_dpmsolver_singlestep
+  elif args.sampler == "heun":
+    scheduler_cls = HeunDiscreteScheduler
+    scheduler_module = diffusers.schedulers.scheduling_heun_discrete
+  elif args.sampler == 'dpm_2' or args.sampler == 'k_dpm_2':
+    scheduler_cls = KDPM2DiscreteScheduler
+    scheduler_module = diffusers.schedulers.scheduling_k_dpm_2_discrete
+  elif args.sampler == 'dpm_2_a' or args.sampler == 'k_dpm_2_a':
+    scheduler_cls = KDPM2AncestralDiscreteScheduler
+    scheduler_module = diffusers.schedulers.scheduling_k_dpm_2_ancestral_discrete
+    scheduler_num_noises_per_step = 2
 
   if args.v_parameterization:
     sched_init_args['prediction_type'] = 'v_prediction'
@@ -1954,13 +1974,16 @@ def main(args):
   scheduler = scheduler_cls(num_train_timesteps=SCHEDULER_TIMESTEPS,
                             beta_start=SCHEDULER_LINEAR_START, beta_end=SCHEDULER_LINEAR_END,
                             beta_schedule=SCHEDLER_SCHEDULE, **sched_init_args)
+
   # clip_sample=Trueにする
   if hasattr(scheduler.config, "clip_sample") and scheduler.config.clip_sample is False:
     print("set clip_sample to True")
     scheduler.config.clip_sample = True
 
-  # custom pipelineをコピったやつを生成する
+  # deviceを決定する
   device = torch.device("cuda" if torch.cuda.is_available() else "cpu")             # "mps"を考量してない
+
+  # custom pipelineをコピったやつを生成する
   vae.to(dtype).to(device)
   text_encoder.to(dtype).to(device)
   unet.to(dtype).to(device)
@@ -2028,7 +2051,9 @@ def main(args):
   def resize_images(imgs, size):
     resized = []
     for img in imgs:
-      resized.append(img.resize(size, Image.Resampling.LANCZOS))
+      r_img = img.resize(size, Image.Resampling.LANCZOS)
+      r_img.filename = img.filename
+      resized.append(r_img)
     return resized
 
   if args.image_path is not None:
@@ -2074,6 +2099,7 @@ def main(args):
         l.extend([im] * args.images_per_prompt)
       mask_images = l
 
+  # 画像サイズにオプション指定があるときはリサイズする
   if init_images is not None and args.W is not None and args.H is not None:
     print(f"resize img2img source images to {args.W}*{args.H}")
     init_images = resize_images(init_images, (args.W, args.H))
@@ -2113,6 +2139,7 @@ def main(args):
 
   for iter in range(args.n_iter):
     print(f"iteration {iter+1}/{args.n_iter}")
+    iter_seed = random.randint(0, 0x7fffffff)
 
     # バッチ処理の関数
     def process_batch(batch, highres_fix, highres_1st=False):
@@ -2146,7 +2173,8 @@ def main(args):
       prompts = []
       negative_prompts = []
       start_code = torch.zeros((batch_size, *noise_shape), device=device, dtype=dtype)
-      noises = [torch.zeros((batch_size, *noise_shape), device=device, dtype=dtype) for _ in range(steps)]
+      noises = [torch.zeros((batch_size, *noise_shape), device=device, dtype=dtype)
+                for _ in range(steps * scheduler_num_noises_per_step)]
       seeds = []
       clip_prompts = []
 
@@ -2198,7 +2226,7 @@ def main(args):
         start_code[i] = torch.randn(noise_shape, device=device, dtype=dtype)
 
         # make each noises
-        for j in range(steps):
+        for j in range(steps * scheduler_num_noises_per_step):
           noises[j][i] = torch.randn(noise_shape, device=device, dtype=dtype)
 
         if i2i_noises is not None:                # img2img noise
@@ -2235,7 +2263,16 @@ def main(args):
         if clip_prompt is not None:
           metadata.add_text("clip-prompt", clip_prompt)
 
-        fln = f"im_{highres_prefix}{step_first + i + 1:06d}.png" if args.sequential_file_name else f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
+        if args.use_original_file_name and init_images is not None:
+          if type(init_images) is list:
+            fln = os.path.splitext(os.path.basename(init_images[i % len(init_images)].filename))[0] + ".png"
+          else:
+            fln = os.path.splitext(os.path.basename(init_images.filename))[0] + ".png"
+        elif args.sequential_file_name:
+          fln = f"im_{highres_prefix}{step_first + i + 1:06d}.png"
+        else:
+          fln = f"im_{ts_str}_{highres_prefix}{i:03d}_{seed}.png"
+
         image.save(os.path.join(args.outdir, fln), pnginfo=metadata)
 
       if not args.no_preview and not highres_1st and args.interactive:
@@ -2347,6 +2384,8 @@ def main(args):
         if predefined_seeds is not None:
           seeds = predefined_seeds[-args.images_per_prompt:]
           predefined_seeds = predefined_seeds[:-args.images_per_prompt]
+        elif args.iter_same_seed:
+          seeds = [iter_seed] * args.images_per_prompt
         else:
           seeds = [random.randint(0, 0x7fffffff) for _ in range(args.images_per_prompt)]
         if args.interactive:
@@ -2416,6 +2455,8 @@ if __name__ == '__main__':
   parser.add_argument("--images_per_prompt", type=int, default=1, help="number of images per prompt / プロンプトあたりの出力枚数")
   parser.add_argument("--outdir", type=str, default="outputs", help="dir to write results to / 生成画像の出力先")
   parser.add_argument("--sequential_file_name", action='store_true',  help="sequential output file name / 生成画像のファイル名を連番にする")
+  parser.add_argument("--use_original_file_name", action='store_true',
+                      help="prepend original file name in img2img / img2imgで元画像のファイル名を生成画像のファイル名の先頭に付ける")
   # parser.add_argument("--ddim_eta", type=float, default=0.0, help="ddim eta (eta=0.0 corresponds to deterministic sampling", )
   parser.add_argument("--n_iter", type=int, default=1, help="sample this often / 繰り返し回数")
   parser.add_argument("--H", type=int, default=None, help="image height, in pixel space / 生成画像高さ")
@@ -2423,7 +2464,10 @@ if __name__ == '__main__':
   parser.add_argument("--batch_size", type=int, default=1, help="batch size / バッチサイズ")
   parser.add_argument("--steps", type=int, default=50, help="number of ddim sampling steps / サンプリングステップ数")
   parser.add_argument('--sampler', type=str, default='ddim',
-                      choices=['ddim', 'pndm', 'lms', 'euler', 'euler_a', 'dpmsolver', 'dpmsolver++', 'k_lms', 'k_euler', 'k_euler_a'], help=f'sampler (scheduler) type / サンプラー（スケジューラ）の種類')
+                      choices=['ddim', 'pndm', 'lms', 'euler', 'euler_a', 'heun', 'dpm_2', 'dpm_2_a', 'dpmsolver',
+                               'dpmsolver++', 'dpmsingle',
+                               'k_lms', 'k_euler', 'k_euler_a', 'k_dpm_2', 'k_dpm_2_a'],
+                      help=f'sampler (scheduler) type / サンプラー（スケジューラ）の種類')
   parser.add_argument("--scale", type=float, default=7.5,
                       help="unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)) / guidance scale")
   parser.add_argument("--ckpt", type=str, default=None, help="path to checkpoint of model / モデルのcheckpointファイルまたはディレクトリ")
@@ -2433,6 +2477,7 @@ if __name__ == '__main__':
   #                     help="Replace CLIP (Text Encoder) to l/14@336 / CLIP(Text Encoder)をl/14@336に入れ替える")
   parser.add_argument("--seed", type=int, default=None,
                       help="seed, or seed of seeds in multiple generation / 1枚生成時のseed、または複数枚生成時の乱数seedを決めるためのseed")
+  parser.add_argument("--iter_same_seed", action='store_true', help='use same seed for all prompts in iteration if no seed specified / 乱数seedの指定がないとき繰り返し内はすべて同じseedを使う（プロンプト間の差異の比較用）')
   parser.add_argument("--fp16", action='store_true', help='use fp16 / fp16を指定し省メモリ化する')
   parser.add_argument("--bf16", action='store_true', help='use bfloat16 / bfloat16を指定し省メモリ化する')
   parser.add_argument("--xformers", action='store_true', help='use xformers / xformersを使用し高速化する')
