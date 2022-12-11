@@ -1,4 +1,4 @@
-# stable-diffusion-2.0-dreambooth
+# stable-diffusion-2-dreambooth
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/thx-pw/stable-diffusion-2-dreambooth/blob/main/stable_diffusion_2_dreambooth_Kohya_S.ipynb)
 
