@@ -15,6 +15,7 @@
 # v14: refactor to use model_util, add log prefix, support safetensors, support vae loading, keep vae in CPU to save the loaded vae
 # v15: model_util update
 # v16: support Diffusers 0.10.0 (v-parameterization training, safetensors in Diffusers) and accelerate 0.15.0
+# v17: add fp16 gradient training (experimental)
 
 import gc
 import time
@@ -921,12 +922,28 @@ def train(args):
   lr_scheduler = diffusers.optimization.get_scheduler(
       args.lr_scheduler, optimizer, num_warmup_steps=args.lr_warmup_steps, num_training_steps=args.max_train_steps)
 
+  # 実験的機能：勾配も含めたfp16学習を行う　モデル全体をfp16にする
+  if args.full_fp16:
+    assert args.mixed_precision == "fp16", "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
+    print("enable full fp16 training.")
+    unet.to(weight_dtype)
+    text_encoder.to(weight_dtype)
+
   # acceleratorがなんかよろしくやってくれるらしい
   unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
       unet, text_encoder, optimizer, train_dataloader, lr_scheduler)
 
   if not cache_latents:
     vae.to(accelerator.device, dtype=weight_dtype)
+
+  # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
+  if args.full_fp16:
+    org_unscale_grads = accelerator.scaler._unscale_grads_
+
+    def _unscale_grads_replacer(optimizer, inv_scale, found_inf, allow_fp16):
+      return org_unscale_grads(optimizer, inv_scale, found_inf, True)
+
+    accelerator.scaler._unscale_grads_ = _unscale_grads_replacer
 
   # resumeする
   if args.resume is not None:
@@ -1177,6 +1194,7 @@ if __name__ == '__main__':
                       help="enable gradient checkpointing / grandient checkpointingを有効にする")
   parser.add_argument("--mixed_precision", type=str, default="no",
                       choices=["no", "fp16", "bf16"], help="use mixed precision / 混合精度を使う場合、その精度")
+  parser.add_argument("--full_fp16", action="store_true", help="fp16 training including gradients / 勾配も含めてfp16で学習する")
   parser.add_argument("--save_precision", type=str, default=None,
                       choices=[None, "float", "fp16", "bf16"], help="precision in saving (available in StableDiffusion checkpoint) / 保存時に精度を変更して保存する（StableDiffusion形式での保存時のみ有効）")
   parser.add_argument("--clip_skip", type=int, default=None,
